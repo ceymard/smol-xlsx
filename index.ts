@@ -141,6 +141,7 @@ export class SmolWorkbook {
         new Map<string, SmolCell>())
       if (keep_sheet?.(sht) === false) { return }
       this.sheets.push(sht)
+      this.sheets_by_name.set(sht.name, sht)
       files_to_read.add("xl/" + rels[sht.id])
     })
 
