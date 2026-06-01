@@ -105,12 +105,97 @@ class SmolSheet {
 
 
 export class SmolWorkbook {
-  constructor() { }
+  constructor(public file: Uint8Array<ArrayBuffer>) {
+    this._parsePreamble()
+  }
 
-  sheets: SmolSheet[] = []
-  sheets_by_name: Map<string, SmolSheet> = new Map()
+  sheets_names: string[] = []
+  private _sheets_by_name: Map<string, SmolSheet> = new Map()
 
-  async read(file: Uint8Array<ArrayBuffer>, keep_sheet?: (sheet: SmolSheet) => boolean) {
+  getSheet(name: string): SmolSheet {
+    let sheet = this._sheets_by_name.get(name)
+    if (!sheet) {
+      throw new Error(`Sheet ${name} not found`)
+    }
+    if (!Number.isFinite(sheet.max_col)) {
+      this._readSheet(name)
+    }
+    return sheet
+  }
+
+  xml_files: { [rId: string]: string } = {}
+  zip_files: { [path: string]: Uint8Array } = {}
+
+  private _getFile(name: string): string {
+    const rid = this.xml_files[name]
+    const obj = unzip(this.file, fil => fil.name === rid)
+    return obj[rid]
+  }
+
+  bg_style: Map<string, string> = new Map()
+  strs: string[] = []
+
+  private _readSheet(name: string): SmolSheet {
+    const s = this._sheets_by_name.get(name)
+
+    if (s == null) {
+      throw new Error(`Sheet ${name} not found`)
+    }
+
+    const strs = this.strs
+
+    const sheet_str = this._getFile(name) //this.files[`xl/${this.rels[s.id]}`]
+    streamXML("c", sheet_str, (node) => {
+      const at = node.attrs
+      if (!at.r) { return }
+
+      const v = node.children.find((c): c is SmolXMLNode => c instanceof SmolXMLNode && c.tag === "v")?.textContent
+      const {row, col} = a1_to_row_col(at.r)
+      const c = at.s ?? ""
+      const cell_obj = {v: null, row, col, A1: at.r} as SmolCell
+      if (at.t === "s") {
+        cell_obj.v = strs[Number(v)] ?? ""
+      } else if (at.t === "b") {
+        cell_obj.v = !!v
+      } else if (at.t === "n") {
+        cell_obj.v = Number(v)
+      } else if (at.t === "e") {
+        cell_obj.error = v
+      } else if (!at.t) {
+        if (v != null) {
+          cell_obj.v = Number(v)
+        }
+      } else if (at.t === "inlineStr") {
+        // they may need to be handled differently
+        cell_obj.v = v ?? ""
+      } else if (at.t === "str") {
+        cell_obj.v = v ?? ""
+      }
+
+      if (cell_obj.v == null) {
+        let styl = this.bg_style.get(at.s ?? "")
+        if (styl) {
+          cell_obj.v = "#" + styl
+        }
+      }
+
+      // console.log(at.s)
+
+      // Only if added to the sheet
+      if (cell_obj.v != null) {
+        s.data.set(`${row}:${col}`, cell_obj)
+        s.min_row = Math.min(s.min_row, row)
+        s.max_row = Math.max(s.max_row, row)
+        s.min_col = Math.min(s.min_col, col)
+        s.max_col = Math.max(s.max_col, col)
+        // #FFFF00
+      }
+    })
+
+    return s
+  }
+
+  _parsePreamble() {
     // console.time("read-mine")
 
     const init_files = new Set([
@@ -123,7 +208,7 @@ export class SmolWorkbook {
 
     const txt = new TextDecoder()
     const files: { [key: string]: string } = {}
-    Object.assign(files, unzip(file, (file) => init_files.has(file.name)))
+    Object.assign(files, unzip(this.file, (file) => init_files.has(file.name)))
 
     const rels: {[rId: string]: string} = {}
     const rels_xml = files["xl/_rels/workbook.xml.rels"]
@@ -131,7 +216,6 @@ export class SmolWorkbook {
       rels[rel.attrs.Id ?? ""] = rel.attrs.Target ?? ""
     })
 
-    const files_to_read = new Set<string>()
     const wb_str = files["xl/workbook.xml"]
     streamXML("sheet", wb_str, (st) => {
       const sht = new SmolSheet(
@@ -139,23 +223,23 @@ export class SmolWorkbook {
         st.attrs.state === "visible",
         st.attrs["r:id"] ?? "",
         new Map<string, SmolCell>())
-      if (keep_sheet?.(sht) === false) { return }
-      this.sheets.push(sht)
-      this.sheets_by_name.set(sht.name, sht)
-      files_to_read.add("xl/" + rels[sht.id])
+
+      this._sheets_by_name.set(sht.name, sht)
+      this.sheets_names.push(sht.name)
+      this.xml_files[sht.name] = `xl/${rels[sht.id]}`
+      // files_to_read.add("xl/" + rels[sht.id])
     })
 
     // Now, re-read the files we need with the collections
-    Object.assign(files, unzip(file,
-      (file) => files_to_read.has(file.name)
-    ))
+    // Object.assign(files, unzip(this.file,
+    //   (file) => files_to_read.has(file.name)
+    // ))
 
     // build the shared strings
-    let strs: string[] = []
     try {
       const strings = files["xl/sharedStrings.xml"]
       streamXML("si", strings, (node) => {
-        strs.push(node.textContent)
+        this.strs.push(node.textContent)
       })
     } catch (e) {
     }
@@ -176,7 +260,6 @@ export class SmolWorkbook {
 
     const style = files["xl/styles.xml"]
     // console.log("STYLE", new DOMParser().parseFromString(style, "application/xml"))
-    const bg_style = new Map<string, string>()
     const fills: string[] = []
 
     streamXML(["cellXfs", "patternFill"], style, (node) => {
@@ -206,69 +289,13 @@ export class SmolWorkbook {
         for (let i = 0, l = node.children.length; i < l; i++) {
           const xf = node.children[i] as SmolXMLNode
           if (xf.attrs.fillId && xf.attrs.fillId !== "0") {
-            bg_style.set(""+i, fills[Number(xf.attrs.fillId)])
+            this.bg_style.set(""+i, fills[Number(xf.attrs.fillId)])
           }
         }
       }
       // console.log(node)
     })
-    // console.log(fills)
-    // console.log(bg_style)
-
-
-    // console.log(style)
-
-    for (let s of this.sheets) {
-      const sheet_str = files[`xl/${rels[s.id]}`]
-      streamXML("c", sheet_str, (node) => {
-        const at = node.attrs
-        if (!at.r) { return }
-
-        const v = node.children.find((c): c is SmolXMLNode => c instanceof SmolXMLNode && c.tag === "v")?.textContent
-        const {row, col} = a1_to_row_col(at.r)
-        const c = at.s ?? ""
-        const cell_obj = {v: null, row, col, A1: at.r} as SmolCell
-        if (at.t === "s") {
-          cell_obj.v = strs[Number(v)] ?? ""
-        } else if (at.t === "b") {
-          cell_obj.v = !!v
-        } else if (at.t === "n") {
-          cell_obj.v = Number(v)
-        } else if (at.t === "e") {
-          cell_obj.error = v
-        } else if (!at.t) {
-          if (v != null) {
-            cell_obj.v = Number(v)
-          }
-        } else if (at.t === "inlineStr") {
-          // they may need to be handled differently
-          cell_obj.v = v ?? ""
-        } else if (at.t === "str") {
-          cell_obj.v = v ?? ""
-        }
-
-        if (cell_obj.v == null) {
-          let styl = bg_style.get(at.s ?? "")
-          if (styl) {
-            cell_obj.v = "#" + styl
-          }
-        }
-
-        // console.log(at.s)
-
-        // Only if added to the sheet
-        if (cell_obj.v != null) {
-          s.data.set(`${row}:${col}`, cell_obj)
-          s.min_row = Math.min(s.min_row, row)
-          s.max_row = Math.max(s.max_row, row)
-          s.min_col = Math.min(s.min_col, col)
-          s.max_col = Math.max(s.max_col, col)
-          // #FFFF00
-        }
-      })
-
-      this.sheets_by_name.set(s.name, s)
 
     }
-  }
+
 }
